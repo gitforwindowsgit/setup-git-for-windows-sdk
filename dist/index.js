@@ -87,7 +87,7 @@ function run() {
                     useCache = true;
                     break;
                 case 'auto':
-                    useCache = flavor !== 'full';
+                    useCache = !['full', 'minimal'].includes(flavor);
                     break;
                 default:
                     useCache = false;
@@ -286,6 +286,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.gitForWindowsUsrBinPath = void 0;
 exports.getArtifactMetadata = getArtifactMetadata;
@@ -295,6 +298,8 @@ const child_process_1 = __nccwpck_require__(2081);
 const rest_1 = __nccwpck_require__(5375);
 const path_1 = __nccwpck_require__(1017);
 const fs = __importStar(__nccwpck_require__(7147));
+const os_1 = __importDefault(__nccwpck_require__(2037));
+const node_fetch_1 = __importDefault(__nccwpck_require__(467));
 // If present, do prefer the build agent's copy of Git
 const externalsGitDir = `${process.env.AGENT_HOMEDIRECTORY}/externals/git`;
 const gitForWindowsRoot = 'C:/Program Files/Git';
@@ -381,38 +386,15 @@ function getViaGit(flavor, architecture, githubToken) {
         const owner = 'git-for-windows';
         const { repo, artifactName } = getArtifactMetadata(flavor, architecture);
         const octokit = githubToken ? new rest_1.Octokit({ auth: githubToken }) : new rest_1.Octokit();
-        let head_sha;
         if (flavor === 'minimal') {
-            const info = yield octokit.actions.listWorkflowRuns({
-                owner,
-                repo,
-                workflow_id: 938271,
-                status: 'success',
-                branch: 'main',
-                event: 'push',
-                per_page: 1
-            });
-            head_sha = info.data.workflow_runs[0].head_sha;
-            /*
-             * There was a GCC upgrade to v14.1 that broke the build with `DEVELOPER=1`,
-             * and `ci-artifacts` was not updated to test-build with `DEVELOPER=1` (this
-             * was fixed in https://github.com/git-for-windows/git-sdk-64/pull/83).
-             *
-             * Work around that by forcing the incorrectly-passing revision back to the
-             * last one before that GCC upgrade.
-             */
-            if (head_sha === '5f6ba092f690c0bbf84c7201be97db59cdaeb891') {
-                head_sha = 'e37e3f44c1934f0f263dabbf4ed50a3cfb6eaf71';
-            }
+            return getMinimalFlavor(owner, repo, artifactName, octokit, githubToken);
         }
-        else {
-            const info = yield octokit.repos.getBranch({
-                owner,
-                repo,
-                branch: 'main'
-            });
-            head_sha = info.data.commit.sha;
-        }
+        const info = yield octokit.repos.getBranch({
+            owner,
+            repo,
+            branch: 'main'
+        });
+        const head_sha = info.data.commit.sha;
         const id = `${artifactName}-${head_sha}${head_sha === 'e37e3f44c1934f0f263dabbf4ed50a3cfb6eaf71' ? '-2' : ''}`;
         core.info(`Got commit ${head_sha} for ${repo}`);
         return {
@@ -477,6 +459,63 @@ function getViaGit(flavor, architecture, githubToken) {
                 });
             })
         };
+    });
+}
+function getMinimalFlavor(owner, repo, artifactName, octokit, githubToken) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const ciArtifactsResponse = yield octokit.repos.getReleaseByTag({
+            owner,
+            repo,
+            tag: 'ci-artifacts'
+        });
+        if (ciArtifactsResponse.status !== 200) {
+            throw new Error(`Failed to get ci-artifacts release from the ${owner}/${repo} repo: ${ciArtifactsResponse.status}`);
+        }
+        const tarGzArtifact = ciArtifactsResponse.data.assets.find(asset => asset.name.endsWith('.tar.gz'));
+        if (!tarGzArtifact) {
+            throw new Error(`Failed to find a tar.gz artifact in the ci-artifacts release of the ${owner}/${repo} repo`);
+        }
+        return {
+            artifactName,
+            id: `ci-artifacts-${tarGzArtifact.updated_at}`,
+            download: (outputDirectory_1, ...args_1) => __awaiter(this, [outputDirectory_1, ...args_1], void 0, function* (outputDirectory, verbose = false) {
+                const tmpFile = `${os_1.default.tmpdir()}/${tarGzArtifact.name}`;
+                core.info(`Downloading ${tarGzArtifact.browser_download_url} to ${tmpFile}...`);
+                yield downloadFile(tarGzArtifact.browser_download_url, {
+                    headers: Object.assign(Object.assign({}, (githubToken ? { Authorization: `Bearer ${githubToken}` } : {})), { Accept: 'application/octet-stream' })
+                }, tmpFile);
+                core.info(`Extracting ${tmpFile} to ${outputDirectory}...`);
+                fs.mkdirSync(outputDirectory);
+                const child = (0, child_process_1.spawn)('C:\\Windows\\system32\\tar.exe', [`-xz${verbose ? 'v' : ''}f`, tmpFile, '-C', outputDirectory], {
+                    stdio: [undefined, 'inherit', 'inherit']
+                });
+                return new Promise((resolve, reject) => {
+                    child.on('close', code => {
+                        if (code === 0) {
+                            core.info('Finished extracting archive.');
+                            fs.rm(tmpFile, () => resolve());
+                        }
+                        else {
+                            reject(new Error(`tar -xzf process exited with code ${code}`));
+                        }
+                    });
+                });
+            })
+        };
+    });
+}
+function downloadFile(url, options, destination) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const response = yield (0, node_fetch_1.default)(url, options);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch ${url}: ${response.statusText}`);
+        }
+        const fileStream = fs.createWriteStream(destination);
+        response.body.pipe(fileStream);
+        return new Promise((resolve, reject) => {
+            fileStream.on('finish', resolve);
+            fileStream.on('error', reject);
+        });
     });
 }
 
