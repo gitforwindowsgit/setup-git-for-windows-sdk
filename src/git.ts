@@ -3,6 +3,8 @@ import {ChildProcess, spawn} from 'child_process'
 import {Octokit} from '@octokit/rest'
 import {delimiter} from 'path'
 import * as fs from 'fs'
+import os from 'os'
+import fetch, {RequestInit} from 'node-fetch'
 
 // If present, do prefer the build agent's copy of Git
 const externalsGitDir = `${process.env.AGENT_HOMEDIRECTORY}/externals/git`
@@ -109,54 +111,36 @@ async function updateHEAD(
   })
 }
 
-export async function getViaGit(
-  flavor: string,
-  architecture: string,
-  githubToken?: string
-): Promise<{
+type GetViaGitResult = {
   artifactName: string
   id: string
   download: (
     outputDirectory: string,
     verbose?: number | boolean
   ) => Promise<void>
-}> {
+}
+
+export async function getViaGit(
+  flavor: string,
+  architecture: string,
+  githubToken?: string
+): Promise<GetViaGitResult> {
   const owner = 'git-for-windows'
 
   const {repo, artifactName} = getArtifactMetadata(flavor, architecture)
 
   const octokit = githubToken ? new Octokit({auth: githubToken}) : new Octokit()
-  let head_sha: string
+
   if (flavor === 'minimal') {
-    const info = await octokit.actions.listWorkflowRuns({
-      owner,
-      repo,
-      workflow_id: 938271,
-      status: 'success',
-      branch: 'main',
-      event: 'push',
-      per_page: 1
-    })
-    head_sha = info.data.workflow_runs[0].head_sha
-    /*
-     * There was a GCC upgrade to v14.1 that broke the build with `DEVELOPER=1`,
-     * and `ci-artifacts` was not updated to test-build with `DEVELOPER=1` (this
-     * was fixed in https://github.com/git-for-windows/git-sdk-64/pull/83).
-     *
-     * Work around that by forcing the incorrectly-passing revision back to the
-     * last one before that GCC upgrade.
-     */
-    if (head_sha === '5f6ba092f690c0bbf84c7201be97db59cdaeb891') {
-      head_sha = 'e37e3f44c1934f0f263dabbf4ed50a3cfb6eaf71'
-    }
-  } else {
-    const info = await octokit.repos.getBranch({
-      owner,
-      repo,
-      branch: 'main'
-    })
-    head_sha = info.data.commit.sha
+    return getMinimalFlavor(owner, repo, artifactName, octokit, githubToken)
   }
+
+  const info = await octokit.repos.getBranch({
+    owner,
+    repo,
+    branch: 'main'
+  })
+  const head_sha = info.data.commit.sha
   const id = `${artifactName}-${head_sha}${head_sha === 'e37e3f44c1934f0f263dabbf4ed50a3cfb6eaf71' ? '-2' : ''}`
   core.info(`Got commit ${head_sha} for ${repo}`)
 
@@ -238,4 +222,97 @@ export async function getViaGit(
       })
     }
   }
+}
+
+async function getMinimalFlavor(
+  owner: string,
+  repo: string,
+  artifactName: string,
+  octokit: Octokit,
+  githubToken?: string
+): Promise<GetViaGitResult> {
+  const ciArtifactsResponse = await octokit.repos.getReleaseByTag({
+    owner,
+    repo,
+    tag: 'ci-artifacts'
+  })
+
+  if (ciArtifactsResponse.status !== 200) {
+    throw new Error(
+      `Failed to get ci-artifacts release from the ${owner}/${repo} repo: ${ciArtifactsResponse.status}`
+    )
+  }
+
+  const tarGzArtifact = ciArtifactsResponse.data.assets.find(asset =>
+    asset.name.endsWith('.tar.gz')
+  )
+
+  if (!tarGzArtifact) {
+    throw new Error(
+      `Failed to find a tar.gz artifact in the ci-artifacts release of the ${owner}/${repo} repo`
+    )
+  }
+
+  return {
+    artifactName,
+    id: `ci-artifacts-${tarGzArtifact.updated_at}`,
+    download: async (
+      outputDirectory: string,
+      verbose: number | boolean = false
+    ): Promise<void> => {
+      const tmpFile = `${os.tmpdir()}/${tarGzArtifact.name}`
+      core.info(
+        `Downloading ${tarGzArtifact.browser_download_url} to ${tmpFile}...`
+      )
+      await downloadFile(
+        tarGzArtifact.browser_download_url,
+        {
+          headers: {
+            ...(githubToken ? {Authorization: `Bearer ${githubToken}`} : {}),
+            Accept: 'application/octet-stream'
+          }
+        },
+        tmpFile
+      )
+      core.info(`Extracting ${tmpFile} to ${outputDirectory}...`)
+      fs.mkdirSync(outputDirectory)
+      const child = spawn(
+        'C:\\Windows\\system32\\tar.exe',
+        [`-xz${verbose ? 'v' : ''}f`, tmpFile, '-C', outputDirectory],
+        {
+          stdio: [undefined, 'inherit', 'inherit']
+        }
+      )
+      return new Promise<void>((resolve, reject) => {
+        child.on('close', code => {
+          if (code === 0) {
+            core.info('Finished extracting archive.')
+            fs.rm(tmpFile, () => resolve())
+          } else {
+            reject(new Error(`tar -xzf process exited with code ${code}`))
+          }
+        })
+      })
+    }
+  }
+}
+
+async function downloadFile(
+  url: string,
+  options: RequestInit,
+  destination: string
+): Promise<void> {
+  const response = await fetch(url, options)
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}: ${response.statusText}`)
+  }
+
+  const fileStream = fs.createWriteStream(destination)
+  response.body.pipe(fileStream)
+
+  return new Promise((resolve, reject) => {
+    fileStream.on('finish', resolve)
+    fileStream.on('error', reject)
+  })
 }
